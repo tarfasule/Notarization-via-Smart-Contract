@@ -123,3 +123,66 @@
 (define-private (not-hash (item (buff 32)) (hash (buff 32)))
   (not (is-eq item hash))
 )
+
+
+(define-constant err-not-authority (err u104))
+
+(define-map trusted-authorities
+  principal 
+  bool
+)
+
+(define-public (add-authority (authority principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set trusted-authorities authority true)
+    (ok true)
+  )
+)
+
+(define-public (verify-document (hash (buff 32)))
+  (let
+    (
+      (doc (unwrap! (map-get? documents {hash: hash}) err-not-found))
+      (is-authority (default-to false (map-get? trusted-authorities tx-sender)))
+    )
+    (asserts! is-authority err-not-authority)
+    (map-set documents
+      {hash: hash}
+      (merge doc {status: "VERIFIED"})
+    )
+    (ok true)
+  )
+)
+
+
+(define-constant err-expired (err u105))
+
+(define-map document-expiry
+  (buff 32)
+  uint
+)
+
+(define-public (set-document-expiry (hash (buff 32)) (expiry-height uint))
+  (let
+    (
+      (doc (unwrap! (map-get? documents {hash: hash}) err-not-found))
+    )
+    (asserts! (is-eq (get owner doc) tx-sender) err-owner-only)
+    (map-set document-expiry hash expiry-height)
+    (ok true)
+  )
+)
+
+(define-read-only (is-document-valid (hash (buff 32)))
+  (let
+    (
+      (expiry (map-get? document-expiry hash))
+      (current-height stacks-block-height)
+    )
+    (if (and (is-some expiry) (> (unwrap! expiry err-not-found) current-height))
+      (ok true)
+      (ok false)
+    )
+  )
+)
