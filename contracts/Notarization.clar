@@ -186,3 +186,144 @@
     )
   )
 )
+
+(define-constant err-access-denied (err u106))
+(define-constant err-invalid-permission (err u107))
+
+(define-map document-permissions
+  { hash: (buff 32), grantee: principal }
+  { read: bool, write: bool, verify: bool }
+)
+
+(define-map permission-grants
+  principal
+  (list 50 { hash: (buff 32), permissions: { read: bool, write: bool, verify: bool } })
+)
+
+(define-read-only (get-document-permissions (hash (buff 32)) (grantee principal))
+  (default-to 
+    { read: false, write: false, verify: false }
+    (map-get? document-permissions { hash: hash, grantee: grantee })
+  )
+)
+
+(define-read-only (get-user-permissions (user principal))
+  (default-to 
+    (list)
+    (map-get? permission-grants user)
+  )
+)
+
+(define-read-only (has-read-access (hash (buff 32)) (user principal))
+  (let
+    (
+      (doc (unwrap! (map-get? documents {hash: hash}) (ok false)))
+      (perms (get-document-permissions hash user))
+    )
+    (ok (or 
+      (is-eq (get owner doc) user)
+      (get read perms)
+    ))
+  )
+)
+
+(define-read-only (has-write-access (hash (buff 32)) (user principal))
+  (let
+    (
+      (doc (unwrap! (map-get? documents {hash: hash}) (ok false)))
+      (perms (get-document-permissions hash user))
+    )
+    (ok (or 
+      (is-eq (get owner doc) user)
+      (get write perms)
+    ))
+  )
+)
+
+(define-read-only (has-verify-access (hash (buff 32)) (user principal))
+  (let
+    (
+      (doc (unwrap! (map-get? documents {hash: hash}) (ok false)))
+      (perms (get-document-permissions hash user))
+      (is-authority (default-to false (map-get? trusted-authorities user)))
+    )
+    (ok (or 
+      (is-eq (get owner doc) user)
+      (get verify perms)
+      is-authority
+    ))
+  )
+)
+
+(define-public (grant-document-access 
+    (hash (buff 32)) 
+    (grantee principal) 
+    (read-perm bool) 
+    (write-perm bool) 
+    (verify-perm bool))
+  (let
+    (
+      (doc (unwrap! (map-get? documents {hash: hash}) err-not-found))
+      (new-perms { read: read-perm, write: write-perm, verify: verify-perm })
+      (current-grants (get-user-permissions grantee))
+      (new-grant { hash: hash, permissions: new-perms })
+    )
+    (asserts! (is-eq (get owner doc) tx-sender) err-owner-only)
+    
+    (map-set document-permissions
+      { hash: hash, grantee: grantee }
+      new-perms
+    )
+    
+    (map-set permission-grants
+      grantee
+      (unwrap-panic (as-max-len?
+        (append current-grants new-grant)
+        u50
+      ))
+    )
+    
+    (ok true)
+  )
+)
+
+;; (define-public (revoke-document-access (hash (buff 32)) (grantee principal))
+;;   (let
+;;     (
+;;       (doc (unwrap! (map-get? documents {hash: hash}) err-not-found))
+;;       (current-grants (get-user-permissions grantee))
+;;       (filtered-grants (filter (lambda (grant) (not (is-eq (get hash grant) hash))) current-grants))
+;;     )
+;;     (asserts! (is-eq (get owner doc) tx-sender) err-owner-only)
+    
+;;     (map-delete document-permissions { hash: hash, grantee: grantee })
+    
+;;     (map-set permission-grants
+;;       grantee
+;;       (unwrap-panic (as-max-len? filtered-grants u50))
+;;     )
+    
+;;     (ok true)
+;;   )
+;; )
+
+
+(define-public (revoke-document-with-access (hash (buff 32)))
+  (let
+    (
+      (has-access (unwrap! (has-write-access hash tx-sender) err-access-denied))
+    )
+    (asserts! has-access err-access-denied)
+    (revoke-document hash)
+  )
+)
+
+(define-public (verify-document-with-access (hash (buff 32)))
+  (let
+    (
+      (has-access (unwrap! (has-verify-access hash tx-sender) err-access-denied))
+    )
+    (asserts! has-access err-access-denied)
+    (verify-document hash)
+  )
+)
