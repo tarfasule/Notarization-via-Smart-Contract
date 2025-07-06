@@ -93,30 +93,24 @@
     (
       (doc (unwrap! (map-get? documents {hash: hash}) err-not-found))
     )
-    (asserts! (is-eq (get owner doc) tx-sender) err-owner-only)
-    
-    (map-set documents
-      {hash: hash}
-      (merge doc {owner: new-owner})
-    )
+    (begin
+      (asserts! (is-eq (get owner doc) tx-sender) err-owner-only)
+      
+      (map-set documents
+        {hash: hash}
+        (merge doc {owner: new-owner})
+      )
 
-    ;; (map-set document-owners
-    ;;   tx-sender
-    ;;   (unwrap-panic (as-max-len? 
-    ;;     (filter (lambda (item) (not-hash item hash)) (get-owner-documents tx-sender))
-    ;;     u100
-    ;;   ))
-    ;; )
-
-    (map-set document-owners
-      new-owner
-      (unwrap-panic (as-max-len? 
-        (append (get-owner-documents new-owner) hash)
-        u100
-      ))
+      (map-set document-owners
+        new-owner
+        (unwrap-panic (as-max-len? 
+          (append (get-owner-documents new-owner) hash)
+          u100
+        ))
+      )
+      
+      (ok true)
     )
-    
-    (ok true)
   )
 )
 
@@ -287,25 +281,20 @@
   )
 )
 
-;; (define-public (revoke-document-access (hash (buff 32)) (grantee principal))
-;;   (let
-;;     (
-;;       (doc (unwrap! (map-get? documents {hash: hash}) err-not-found))
-;;       (current-grants (get-user-permissions grantee))
-;;       (filtered-grants (filter (lambda (grant) (not (is-eq (get hash grant) hash))) current-grants))
-;;     )
-;;     (asserts! (is-eq (get owner doc) tx-sender) err-owner-only)
-    
-;;     (map-delete document-permissions { hash: hash, grantee: grantee })
-    
-;;     (map-set permission-grants
-;;       grantee
-;;       (unwrap-panic (as-max-len? filtered-grants u50))
-;;     )
-    
-;;     (ok true)
-;;   )
-;; )
+(define-public (revoke-document-access (hash (buff 32)) (grantee principal))
+  (let
+    (
+      (doc (unwrap! (map-get? documents {hash: hash}) err-not-found))
+    )
+    (begin
+      (asserts! (is-eq (get owner doc) tx-sender) err-owner-only)
+      
+      (map-delete document-permissions { hash: hash, grantee: grantee })
+      
+      (ok true)
+    )
+  )
+)
 
 
 (define-public (revoke-document-with-access (hash (buff 32)))
@@ -325,5 +314,124 @@
     )
     (asserts! has-access err-access-denied)
     (verify-document hash)
+  )
+)
+
+(define-constant err-batch-empty (err u108))
+(define-constant err-batch-limit (err u109))
+(define-constant max-batch-size u10)
+
+(define-public (batch-notarize-documents 
+    (doc-list (list 10 { hash: (buff 32), title: (string-ascii 64), description: (string-ascii 256) })))
+  (let
+    (
+      (batch-size (len doc-list))
+      (timestamp (unwrap-panic (get-stacks-block-info? time u0)))
+    )
+    (asserts! (> batch-size u0) err-batch-empty)
+    (asserts! (<= batch-size max-batch-size) err-batch-limit)
+    
+    (ok (map batch-notarize-single doc-list))
+  )
+)
+
+(define-private (batch-notarize-single (doc { hash: (buff 32), title: (string-ascii 64), description: (string-ascii 256) }))
+  (let
+    (
+      (hash (get hash doc))
+      (title (get title doc))
+      (description (get description doc))
+      (timestamp (unwrap-panic (get-stacks-block-info? time u0)))
+    )
+    (if (is-none (map-get? documents {hash: hash}))
+      (begin
+        (map-set documents
+          {hash: hash}
+          {
+            owner: tx-sender,
+            timestamp: timestamp,
+            title: title,
+            description: description,
+            status: "ACTIVE"
+          }
+        )
+        (map-set document-owners
+          tx-sender
+          (unwrap-panic (as-max-len? 
+            (append (get-owner-documents tx-sender) hash)
+            u100
+          ))
+        )
+        (var-set total-documents (+ (var-get total-documents) u1))
+        (ok hash)
+      )
+      (err err-already-notarized)
+    )
+  )
+)
+
+(define-public (batch-revoke-documents (hashes (list 10 (buff 32))))
+  (let
+    (
+      (batch-size (len hashes))
+    )
+    (asserts! (> batch-size u0) err-batch-empty)
+    (asserts! (<= batch-size max-batch-size) err-batch-limit)
+    
+    (ok (map batch-revoke-single hashes))
+  )
+)
+
+(define-private (batch-revoke-single (hash (buff 32)))
+  (match (map-get? documents {hash: hash})
+    doc (if (is-eq (get owner doc) tx-sender)
+          (begin
+            (map-set documents
+              {hash: hash}
+              (merge doc {status: "REVOKED"})
+            )
+            (ok true)
+          )
+          (err err-owner-only)
+        )
+    (err err-not-found)
+  )
+)
+
+(define-public (batch-verify-documents (hashes (list 10 (buff 32))))
+  (let
+    (
+      (batch-size (len hashes))
+      (is-authority (default-to false (map-get? trusted-authorities tx-sender)))
+    )
+    (asserts! (> batch-size u0) err-batch-empty)
+    (asserts! (<= batch-size max-batch-size) err-batch-limit)
+    (asserts! is-authority err-not-authority)
+    
+    (ok (map batch-verify-single hashes))
+  )
+)
+
+(define-private (batch-verify-single (hash (buff 32)))
+  (match (map-get? documents {hash: hash})
+    doc (begin
+          (map-set documents
+            {hash: hash}
+            (merge doc {status: "VERIFIED"})
+          )
+          (ok true)
+        )
+    (err err-not-found)
+  )
+)
+
+(define-read-only (get-batch-status (hashes (list 10 (buff 32))))
+  (map get-document-status hashes)
+)
+
+(define-private (get-document-status (hash (buff 32)))
+  (match (map-get? documents {hash: hash})
+    doc (ok (get status doc))
+    (err err-not-found)
   )
 )
