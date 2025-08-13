@@ -435,3 +435,255 @@
     (err err-not-found)
   )
 )
+
+;; Document Versioning System - Track document evolution with immutable history
+(define-constant err-version-not-found (err u110))
+(define-constant err-invalid-version (err u111))
+(define-constant err-no-previous-version (err u112))
+(define-constant max-change-description u200)
+(define-constant max-versions-per-document u50)
+
+;; Map to store document versions: {document-id, version} -> version-data
+(define-map document-versions
+  { document-id: (buff 32), version: uint }
+  {
+    version-hash: (buff 32),
+    timestamp: uint,
+    author: principal,
+    change-description: (string-ascii 200),
+    previous-version: (optional uint),
+    is-current: bool
+  }
+)
+
+;; Map to track latest version number for each document
+(define-map document-version-counter
+  (buff 32)
+  uint
+)
+
+;; Map to store document version history as a list
+(define-map document-version-history
+  (buff 32)
+  (list 50 uint)
+)
+
+;; Read-only function to get a specific version of a document
+(define-read-only (get-document-version (document-id (buff 32)) (version uint))
+  (match (map-get? document-versions { document-id: document-id, version: version })
+    version-data (ok version-data)
+    (err err-version-not-found)
+  )
+)
+
+;; Read-only function to get the current version number for a document
+(define-read-only (get-current-version-number (document-id (buff 32)))
+  (default-to u0 (map-get? document-version-counter document-id))
+)
+
+;; Read-only function to get all version numbers for a document
+(define-read-only (get-document-version-history (document-id (buff 32)))
+  (default-to (list) (map-get? document-version-history document-id))
+)
+
+;; Read-only function to get the current version data
+(define-read-only (get-current-version (document-id (buff 32)))
+  (let
+    (
+      (current-version-num (get-current-version-number document-id))
+    )
+    (if (> current-version-num u0)
+      (get-document-version document-id current-version-num)
+      (err err-version-not-found)
+    )
+  )
+)
+
+;; Read-only function to compare two versions
+(define-read-only (compare-versions (document-id (buff 32)) (version1 uint) (version2 uint))
+  (let
+    (
+      (v1-data (unwrap! (get-document-version document-id version1) (err err-version-not-found)))
+      (v2-data (unwrap! (get-document-version document-id version2) (err err-version-not-found)))
+    )
+    (ok {
+      version1: {
+        version: version1,
+        hash: (get version-hash v1-data),
+        timestamp: (get timestamp v1-data),
+        author: (get author v1-data),
+        description: (get change-description v1-data)
+      },
+      version2: {
+        version: version2,
+        hash: (get version-hash v2-data),
+        timestamp: (get timestamp v2-data),
+        author: (get author v2-data),
+        description: (get change-description v2-data)
+      }
+    })
+  )
+)
+
+;; Public function to create a new version of an existing document
+(define-public (create-document-version 
+    (document-id (buff 32))
+    (new-version-hash (buff 32))
+    (change-description (string-ascii 200)))
+  (let
+    (
+      (doc (unwrap! (map-get? documents { hash: document-id }) err-not-found))
+      (current-version-num (get-current-version-number document-id))
+      (new-version-num (+ current-version-num u1))
+      (timestamp (unwrap-panic (get-stacks-block-info? time u0)))
+      (current-history (get-document-version-history document-id))
+    )
+    (begin
+      ;; Only document owner can create versions
+      (asserts! (is-eq (get owner doc) tx-sender) err-owner-only)
+      
+      ;; Validate inputs
+      (asserts! (is-eq (len new-version-hash) u32) err-invalid-hash)
+      (asserts! (<= (len change-description) max-change-description) err-invalid-version)
+      (asserts! (<= new-version-num max-versions-per-document) err-batch-limit)
+      
+      ;; Mark previous version as not current if it exists
+      (if (> current-version-num u0)
+        (map-set document-versions
+          { document-id: document-id, version: current-version-num }
+          (merge 
+            (unwrap-panic (map-get? document-versions { document-id: document-id, version: current-version-num }))
+            { is-current: false }
+          )
+        )
+        true
+      )
+      
+      ;; Create new version entry
+      (map-set document-versions
+        { document-id: document-id, version: new-version-num }
+        {
+          version-hash: new-version-hash,
+          timestamp: timestamp,
+          author: tx-sender,
+          change-description: change-description,
+          previous-version: (if (> current-version-num u0) (some current-version-num) none),
+          is-current: true
+        }
+      )
+      
+      ;; Update version counter
+      (map-set document-version-counter document-id new-version-num)
+      
+      ;; Update version history
+      (map-set document-version-history
+        document-id
+        (unwrap-panic (as-max-len?
+          (append current-history new-version-num)
+          u50
+        ))
+      )
+      
+      (ok { document-id: document-id, version: new-version-num, version-hash: new-version-hash })
+    )
+  )
+)
+
+;; Public function to initialize versioning for an existing document
+(define-public (initialize-document-versioning 
+    (document-id (buff 32))
+    (initial-description (string-ascii 200)))
+  (let
+    (
+      (doc (unwrap! (map-get? documents { hash: document-id }) err-not-found))
+      (existing-version (get-current-version-number document-id))
+      (timestamp (get timestamp doc))
+    )
+    (begin
+      ;; Only document owner can initialize versioning
+      (asserts! (is-eq (get owner doc) tx-sender) err-owner-only)
+      
+      ;; Check if versioning is already initialized
+      (asserts! (is-eq existing-version u0) err-already-notarized)
+      
+      ;; Create initial version (v1) using the original document
+      (map-set document-versions
+        { document-id: document-id, version: u1 }
+        {
+          version-hash: document-id,
+          timestamp: timestamp,
+          author: (get owner doc),
+          change-description: initial-description,
+          previous-version: none,
+          is-current: true
+        }
+      )
+      
+      ;; Set version counter to 1
+      (map-set document-version-counter document-id u1)
+      
+      ;; Initialize version history
+      (map-set document-version-history document-id (list u1))
+      
+      (ok { document-id: document-id, version: u1, initialized: true })
+    )
+  )
+)
+
+;; Public function to revert to a previous version (creates new version with old content)
+(define-public (revert-to-version 
+    (document-id (buff 32))
+    (target-version uint)
+    (revert-description (string-ascii 200)))
+  (let
+    (
+      (doc (unwrap! (map-get? documents { hash: document-id }) err-not-found))
+      (target-version-data (unwrap! (get-document-version document-id target-version) err-version-not-found))
+      (target-hash (get version-hash target-version-data))
+    )
+    (begin
+      ;; Only document owner can revert versions
+      (asserts! (is-eq (get owner doc) tx-sender) err-owner-only)
+      
+      ;; Create new version with the target version's hash
+      (create-document-version document-id target-hash revert-description)
+    )
+  )
+)
+
+;; Read-only function to get version statistics for a document
+(define-read-only (get-version-statistics (document-id (buff 32)))
+  (let
+    (
+      (total-versions (get-current-version-number document-id))
+      (version-history (get-document-version-history document-id))
+    )
+    (ok {
+      total-versions: total-versions,
+      has-versioning: (> total-versions u0),
+      version-history: version-history,
+      latest-version: total-versions
+    })
+  )
+)
+
+;; Read-only function to get version chain (trace back through previous versions)
+(define-read-only (get-version-chain (document-id (buff 32)) (from-version uint))
+  (let
+    (
+      (version-data (unwrap! (get-document-version document-id from-version) (err err-version-not-found)))
+      (previous-version (get previous-version version-data))
+    )
+    (ok {
+      current-version: from-version,
+      has-previous: (is-some previous-version),
+      previous-version: previous-version,
+      author: (get author version-data),
+      timestamp: (get timestamp version-data),
+      description: (get change-description version-data)
+    })
+  )
+)
+
+
+
